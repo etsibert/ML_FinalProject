@@ -1,0 +1,243 @@
+---
+title: "Machine Learning Final Project"
+author: "Eric Tsibertzopoulos"
+date: "4/7/2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Project Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity relatively inexpensively. One thing that people using such devices regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. 
+
+###Project Objective
+In this project, our goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants and try to predict 5 distinct activities using 160 or less predictor variables.  This will be a classification problem since the response variable is a factor containing 5 levels (A, B, C, D, E) that corresponse to five unique activities.
+
+###Data Source
+The training and test data sets for this project come from: [http://groupware.les.inf.puc-rio.br/har](http://groupware.les.inf.puc-rio.br/har).
+
+## R Packages for the Project
+The following R packages were utilized in this project.
+```{r, echo=T, warning=F, error=F, message=F}
+library(caret)
+library(rpart)
+library(randomForest)
+library(gbm)
+library(reshape2)
+library(corrplot)
+library(rpart.plot)
+```
+
+## Data Sets
+
+```{r, echo=T, warning=F, error=F, message=F}
+#training<-read.csv(url("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"))
+#The above command takes too long to download the data, we will use local data files.
+training<-read.csv("~/Downloads/ML/Project/pml-training.csv")
+testing<-read.csv("~/Downloads/ML/Project/pml-testing.csv")
+set.seed(123)
+```
+
+The dimensions of the training and testing sets are: `r dim(training)` and `r dim(testing)` respectivelly.
+A training data set with 160 variables and 19K observations could present some computing challenges for regular PCs. Typical corss-validation of Ensemble algorithms like Random Forests and Boosting algorithms, require a lot of resampling, build large numbers of trees and run over many iterations.  We will need to do some work pre-processing the training and testing data sets in order to reduce dimensionality.
+
+## Exploratory Data Analysis
+Before even attempting any Principal Component Analysis (PCA) to reduce the dimensionality of the training data set, we can attmept simple variable exlusions.  Numeric variables with large ratios of NAs will not add any predictive value to our models. Caret also contains a function that can identify Near-Zero-Value variables that need to be excluded. A simple str() command on the training set reveals some other variables (indexes and dates) that will have no effect in modeling.
+
+###Removal of obvious, useless variables
+Variables like X, user_name, raw_timestamp_part_1, raw_timestamp_part_2, cvtd_timestamp will add no value to a predictive model.
+
+```{r, echo=T, warning=F, error=F, message=F}
+removeTrainCols<-which(colnames(training) %in% c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "num_window"))
+training<-training[,-removeTrainCols]
+dim(training)
+
+removeTestCols<-which(colnames(testing) %in% c("X", "user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "num_window"))
+testing<-testing[,-removeTestCols]
+dim(testing)
+```
+
+###Removal of Near-Zero-Value variables
+Let's use Caret to detect near-zero-value variables.
+```{r, echo=T, warning=F, error=F, message=F}
+insignificantVariables<-nearZeroVar(training)
+insignificantVariables
+training<-training[,-insignificantVariables]
+dim(training)
+testing<-testing[,-insignificantVariables]
+dim(testing)
+```
+
+###Removal of features with large NA ratios
+A simple str() still reveals a lot of variables with NAs. 
+```{r, echo=T, warning=F, error=F, message=F}
+Cols_withNAs<-apply(training, 2, function(c){any(is.na(c))})
+toRemove<-which(colnames(training) %in% colnames(training[,Cols_withNAs[Cols_withNAs=T]]))
+toRemove
+NA_Subset<-training[,toRemove]
+NARatioForNAColumn<-function(x){table(is.na(x))[2]/length(x)}
+NARatios<-apply(NA_Subset,2,function(e){NARatioForNAColumn(e)})
+NARatios
+```
+
+Since the NA ratios of the detected columns exceeds 95% they can be removed from both training and testing sets.
+```{r, echo=T, warning=F, error=F, message=F}
+training<-training[,-toRemove]
+testing<-testing[,-toRemove]
+```
+
+The dimensions of the training and testing sets are now: `r dim(training)` and `r dim(testing)` respectivelly.
+The testing data set does not contian the classe response variable. However it contains an index variable prblem_id that does not exist in training. We need to remove problem_id from tresting.
+
+```{r, echo=T, warning=F, error=F, message=F}
+testing<-testing[,-which(colnames(testing)%in%c("problem_id"))]
+colnames(testing) %in% colnames(training)
+dim(testing)
+```
+
+Classification and regression algorithms could be affected by large variance in predictor variables.  Perdictor variables with very large values could bias the performance of the model.  Let's investigate if we need to center and scale our numeric variables in the training data set.
+
+```{r, echo=T, warning=F, error=F, message=F}
+numerics<-training[,-53]
+meltedNumercis<-melt(numerics)
+ggplot(meltedNumercis, aes(x=variable, y=value))+geom_boxplot()
+```
+
+Based on the above box-plot, I recommend we transform, center and scale the numeric predictors.  Additionally one can look at the Skewness of such variables and apply the necessary tranforms.  In this project we will only center and scale the predictors.
+
+## Data Preparation for Modeling
+We are going to use the testing set from the original data source, to Evaluate predictions for the 20 cases once we select a classification model that has the best accuracy. We will use the training data set for model training (10-fold cross-validation with at least 3 repetitions). We will make a 70/30 split of the training set for training and testing purposes.
+
+```{r, echo=T, warning=F, error=F, message=F}
+inTrain<-createDataPartition(training$classe, p=0.7, list=F)
+mTrainSet<-training[inTrain,]
+mTestSet<-training[-inTrain,]
+```
+
+Now that we have the training/testing split we will apply the centering and scaling transformations on both sets, using caret.
+```{r, echo=T, warning=F, error=F, message=F}
+preProcessed<-preProcess(mTrainSet, method = c("center", "scale"))
+mTrainSet<-predict(preProcessed, mTrainSet[,-53])
+
+mTrainSet$classe<-training[inTrain,]$classe  #re-assign the response variable to the transformed training set.
+dim(mTrainSet)
+```
+
+Apply transforms on the testing data set as well.
+```{r, echo=T, warning=F, error=F, message=F}
+mTestSet<-predict(preProcessed, mTestSet)
+dim(mTestSet)
+```
+
+Finally, before start modeling, let's take a look at possible correlations among the numeric predictors.
+```{r, echo=T, warning=F, error=F, message=F}
+corMat <- cor(mTrainSet[, -53])
+corrplot(corMat, order = "FPC", method = "color", type = "lower", tl.cex = 0.6, tl.col = rgb(0, 0, 0))
+```
+
+Although we took action to remove near-zero-value variables, we still see some strongly (postively and negatively) correlated predictors.
+We anticipate that some of the `r ncol(mTrainSet)-1` predictors will not score highly on importance once the models are trained.
+
+## Models
+Before we start exploring Decision Tree, Random Forest and Boosting models, let's enable parallel processing on 3 CPU cores.
+```{r, echo=T, warning=F, error=F, message=F}
+library(doMC)
+registerDoMC(cores=3)
+modelEval<-list() #structure for storing model evaluation metrics
+```
+
+We will attemtp 3 tpyes of medels: 1) RPART Decision Tree, 2) Random Forest (Ensemble), and 3) GBM Boosting.  For each of the modeling attempts we will use 10-Fold cross validation and we will attempt at least 3 iterations.  The cross-validation parameter can be set up in the caret TrainControl object.
+```{r, echo=T, warning=F, error=F, message=F}
+ctr<-trainControl(method="cv", number=10, repeats=3, allowParallel = T)
+```
+
+#### RPART Decision Tree
+Single, cross validated RPART decision tree.
+```{r, echo=T, warning=F, error=F, message=F}
+model_rpart<-train(classe~., method="rpart", data=mTrainSet, trControl=ctr)
+rpart.plot(model_rpart$finalModel)
+```
+
+Generate predictions for the use cases in the testing set (split from the original Training set). 
+```{r, echo=T, warning=F, error=F, message=F}
+pred_rpart<-predict(model_rpart, mTestSet)
+cm<-confusionMatrix(pred_rpart,mTestSet$classe)
+cm
+#model_rpart$finalModel$variable.importance
+```
+We see that the RPART classification accuracy is slightly over 55%.
+Add the RPART model in our result structure.
+```{r, echo=T, warning=F, error=F, message=F}
+li<-list(Model="RPART Decision Tree, 10-fold Cross Validation", Accuracy=cm$overall[[1]], Out_of_Sample_Error=1-cm$overall[[1]])
+modelEval[length(modelEval)+1]<-list(li)
+```
+
+#### Random Forest, Ensemble Modeling
+Random Forest model, 10-fold cross validated, building up to 500 decision trees across 3 iterations.
+```{r, echo=T, warning=F, error=F, message=F}
+ctr<-trainControl(method="cv", number=10, repeats=3, allowParallel = T)
+model_RF<-train(classe~., method="rf", data=mTrainSet, trControl=ctr, do.trace=F, ntree=500)
+plot(model_RF$finalModel)
+```
+
+Generate predictions for the use cases in the testing set (split from the original Training set). 
+```{r, echo=T, warning=F, error=F, message=F}
+pred_RF<-predict(model_RF, mTestSet)
+cm<-confusionMatrix(pred_RF,mTestSet$classe)
+cm
+#t<-getTree(model_RF$finalModel, 27, labelVar = T)
+variableImportance<-varImp(model_RF)
+plot(variableImportance)
+
+##Book keeping
+li<-list(Model="Random Forest, 10-fold Cross Validation", Accuracy=cm$overall[[1]], Out_of_Sample_Error=1-cm$overall[[1]])
+modelEval[length(modelEval)+1]<-list(li)
+```
+
+#### Gradient Boosting, Ensemble Modeling
+Gradient Boosting model, 10-fold crossvalidated, over 3 repetitions.
+```{r, echo=T, warning=F, error=F, message=F}
+ctr<-trainControl(method="repeatedcv", number=10, repeats=3, allowParallel = T)
+model_GBM<-train(classe~., method="gbm", data=mTrainSet, trControl=ctr)
+model_GBM$results
+```
+
+Generate predictions for the use cases in the testing set (split from the original Training set). 
+```{r, echo=T, warning=F, error=F, message=F}
+pred_GBM<-predict(model_GBM, mTestSet)
+cm<-confusionMatrix(pred_GBM,mTestSet$classe)
+cm
+
+#Book keeping
+li<-list(Model="Boosting GBM, 10-fold Cross Validation", Accuracy=cm$overall[[1]], Out_of_Sample_Error=1-cm$overall[[1]])
+modelEval[length(modelEval)+1]<-list(li)
+```
+
+## Winning Model and Case Predictions
+```{r, echo=F, warning=F, error=F, message=F}
+models<-data.frame(t(sapply(modelEval, `[`)))
+knitr::kable(models)
+```
+
+```{r, echo=F, warning=F, error=F, message=F}
+accuracy<-models$Accuracy[[2]]
+ose<-1-accuracy
+```
+
+The Random Forest model has the best cross-validated performance. Its accuracy is: `r accuracy`. 
+The out-of-sample error is 1-`r accuracy` = `r ose`.
+We will select this model to predict (model Evaluation) the original 20 test cases in the Testing data set.
+
+First we will have to apply the same transformations (center and scale) on the evaluation data set.
+```{r, echo=T, warning=F, error=F, message=F}
+transformed_TestCases<-predict(preProcessed ,testing)
+```
+
+Now we can predict the evaluation cases.
+```{r, echo=T, warning=F, error=F, message=F}
+pred_testCases<-predict(model_RF, transformed_TestCases)
+pred_testCases
+```
+
